@@ -1,0 +1,324 @@
+desc:ChugZone
+
+/*
+(C) 2024 S.D.Smith all rights reserved
+*strictly non-commercial usage* 
+i.e. Fine for commercial songs e.t.c., just don't use the 
+src code/jsfx  in a commercial project don't try and sell it!
+ 
+Simple Metal-Zone style distortion
+based on the works/analysis from
+
+https://electricdruid.net/boss-mt-2-metal-zone-pedal-analysis/
+
+Implementation:
+
+Simple 8x oversampled Hard Clipper
+RBJ BiQuads
+Simple Bias "Gate"
+Focus control - changes PreEQ Bandwidth
+Distance control - changes the PostEQ peaks - hidden from UI
+100% Stereo processing - independant dual channel
+Uber gain - up to 6,300,000 x ! 24bit limit
+
+*notes* not an exact copy - just some of the EQ is the same, or
+tried to match lol, it sounds *similar* to my real world MT-2
+which is good enough for me!
+
+Sounds pretty good - modern metal crunchy goodness
+fails badly on the downward transition into non-clippyness at 
+high gain but it's still very usable.
+
+With high gain settings best results for speedy picking
+are with touch/scuff picking i.e. just touch
+the string or scrape across the top of the string 
+with the pick - don't dig into the strings at all,
+less noise, more actual "musical" note and betterer tone e.t.c. 
+The faster you play the less you should dig into the strings.
+*/
+
+slider1:preq=0.5<0,1>-Focus
+slider2:colour=0<-1,1>-Colour
+slider3:gain_db=34<0,68,1>-Gain
+slider4:gate=1<0,2>-Gate
+slider5:level=0.5<0,1>-Level
+slider6:bassdb=0<-20,20>-Bass
+slider7:highdb=0<-20,20>-High
+slider8:middb=0<-15,15>-Mid
+slider9:midfreq=3150<400,6000>-MidFreq
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+options:no_meter
+options:gfx_hz=30
+options:gfx_idle
+import stronic-lib.js-inc
+
+@init
+mem=0;
+
+function SetFontSize(size)      ( gfx_setfont(1,"Arial Black",size););
+function Quantise(v,amount)     (sign(v)*((abs(v)*amount)&0xffffffff)/amount;);
+function lerp(v,s,e)            ( (s-e)*c+s; );
+function clamp(x,minv,maxv)     ( min(max(x,minv),maxv););
+function smoothstep(x )         ( x*x*(3.0-2.0*x););
+function smoothstep3(x)         ( x*x*x*(x*(x*6.0-15.0)+10.0););
+function tanh(x)                ((exp(x)-exp(-x))/(exp(x)+exp(-x)););
+function glstep(v,edge0,edge1)  ( t = clamp((v - edge0) / (edge1 - edge0), 0.0, 1.0);t*t*(3.0-2.0*t);); 
+
+function LinearToDB(x,dmin)     ( (-20*log10(x/10)/-dmin); );
+function DBtoLinear(x)          ( pow(10,x/10););
+// 0=a1 1=a1 2=b0 3=b1 4=b2 5=prev1 6=prev2
+function BiQuadHiShelf(data,freq,gain)
+(
+  V = pow(10.0, abs(gain) / 20.0);
+  K = tan($pi * freq / srate);
+
+  (gain >= 0) ?
+    (    // boost
+    norm = 1 / (1 + sqrt(2) * K + K * K);
+    data[2] = (V + sqrt(2 * V) * K + K * K) * norm;
+    data[3] = 2 * (K * K - V) * norm;
+    data[4] = (V - sqrt(2 * V) * K + K * K) * norm;
+    data[0] = 2 * (K * K - 1) * norm;
+    data[1] = (1 - sqrt(2) * K + K * K) * norm;
+    )
+    :
+    (    // cut
+    norm = 1 / (V + sqrt(2 * V) * K + K * K);
+    data[2] = (1 + sqrt(2) * K + K * K) * norm;
+    data[3] = 2 * (K * K - 1) * norm;
+    data[4] = (1 - sqrt(2) * K + K * K) * norm;
+    data[0] = 2 * (K * K - V) * norm;
+    data[1] = (V - sqrt(2 * V) * K + K * K) * norm;
+    );
+);
+
+function BiQuadPeak(Data,freq,q,gain)
+(
+K = tan($pi * freq / (srate));
+Vboost = pow(10.0, abs(Gain) / 20.0);
+Vcut = pow(10.0, abs(Gain) / 20.0);
+(Gain >= 0) ? Vcut=1 : Vboost=1;
+norm = 1.0 / (1.0 + Vcut / q * K + K * K);
+Data[2] = (1.0 + Vboost / q * K + K * K) * norm;
+Data[3] = 2.0 * (K * K - 1.0) * norm;
+Data[4] = (1.0 - Vboost / q * K + K * K) * norm;
+Data[0] = Data[3];
+Data[1] = (1.0 - Vcut / q * K + K * K) * norm;
+);
+
+function BiQuadBandPass(Data,freq,q)
+(
+  K = tan($pi * freq / (srate));
+  norm = 1.0 / (1.0 + K / q + K * K);
+  Data[2] = K / q * norm;
+  Data[3] = 0.0;
+  Data[4] = -Data[2];
+  Data[0] = 2.0 * (K * K - 1.0) * norm;
+  Data[1] = (1.0 - K / q + K * K) * norm;
+);
+
+
+// 0=a1 1=a1 2=b0 3=b1 4=b2 5=prev1 6=prev2
+function BiQuadProcess(Data,in) local (bout)
+(
+bout = in * Data[2] + Data[5];
+Data[5] = (in * Data[3]) + Data[6] - (Data[0] * bout);
+Data[6] = (in * Data[4]) - (Data[1] * bout);
+bout;
+);
+
+// Reaper JSFX cannot force a call to @sliders
+// that only gets called when the original
+// reaper UI sliders are manually changed
+// so it's best to wrap up any slider code
+// and call that function whenever u like
+
+function UpdateSliders  ()
+(
+// Various 
+gain=DBtoLinear(gain_db);
+oversample=8;
+oooversample=1/oversample;
+// Pre EQ - User preeq changes the Q with the Focus control
+BiQuadBandPass(Filters+8*0,1000,preq*1.5+0.5); // Left
+BiQuadBandPass(Filters+8*1,1000,preq*1.5+0.5); // Right
+
+// Post EQ - these two peaks are the Metal-Zone "sound"
+PEBW=0.75;
+BiQuadPeak(Filters+8*2,100+colour*50,PEBW,5); // Left
+BiQuadPeak(Filters+8*3,100+colour*50,PEBW,5); // Right
+BiQuadPeak(Filters+8*4,1400-colour*400,PEBW,9.5); // Left
+BiQuadPeak(Filters+8*5,1400-colour*400,PEBW,9.5); // Right
+
+// Post EQ - User -bas==104 high= 5khz? mid = 240-6k
+// Q is unknown - so just Guessing here
+BiQuadPeak(Filters+8*6,105,1/3.1,bassdb); // Left
+BiQuadPeak(Filters+8*7,105,1/3.1,bassdb); // Right
+BiQuadPeak(Filters+8*8,midfreq,PEBW*2,middb); // Left
+BiQuadPeak(Filters+8*9,midfreq,PEBW*2,middb); // Right
+BiQuadHiShelf(Filters+8*10,5000,highdb); // Left
+BiQuadHiShelf(Filters+8*11,5000,highdb); // Right
+
+);
+
+AddSliderFloat("Focus",0.5,0.0,1,"");
+AddSliderFloat("Distance",0,-1,1,""); // Not actually used yet
+AddSliderFloat("Dist",34,0,68,""); // 68 = 6.3 millon = max for 24bit
+AddSliderFloat("Noise-R",1,0,2,"");
+AddSliderFloat("Level",0.5,0.0,1,"");
+AddSliderFloat("Bass",0,-20,20,"");
+AddSliderFloat("High",0,-20,20,"");
+AddSliderFloat("Mid",0,-15,15,"");
+AddSliderFloat("Mid-Freq",3150,240,6000,"");
+
+
+@gfx 500 300
+// set to 0 if u want to resize!
+1 ? ( gfx_w=500; gfx_h=300; );
+
+function vgrad(x,y,w,h)
+(
+rd=(ColourStack[cstack-4]-ColourStack[cstack-8])/h;
+gd=(ColourStack[cstack-3]-ColourStack[cstack-7])/h;
+bd=(ColourStack[cstack-2]-ColourStack[cstack-6])/h;
+ad=(ColourStack[cstack-1]-ColourStack[cstack-5])/h;
+gfx_gradrect(x,y,w,h,ColourStack[cstack-8],ColourStack[cstack-7],ColourStack[cstack-6],ColourStack[cstack-5],0,0,0,0,rd,gd,bd,ad);
+);
+
+StartGFX(gfx_w,gfx_h,26,13);
+
+
+pushcolour(0,0,0,1);
+pushcolour(0.15,0.15,0.15,1);
+vgrad(0,0,gfx_w,gfx_h);
+
+pushcolour(0.3,0.3,0.3,1);
+pushcolour(1,0.25,0.0,1);
+gfx_setfont(1,"bauhaus 93",cell_len*2);
+TextOutline(1.2,2.75,"Chug-Zone",8,0.102);
+pushcolour(0.0,0.0,0.0,1);
+pushcolour(0.3,0.3,0.3,1);
+
+NoDialValues=1;
+gfx_setfont(1,"bauhaus 93",cell_len*0.75);
+
+MediumDial(3,5.6,0);      // Focus
+MediumDial(3,10,3);       // Gate
+MediumDial(9.5,5.6,5);    // Bass
+MediumDial(9.5,10,6);     // Hi
+MediumDial(16,5.6,7);     // Mid
+MediumDial(16,10,8);      // Mid-Freq
+
+MediumDial(23,5.6,2);     // Gain
+MediumDial(23,10,4);      // Level
+pushcolour(1,1,1,0);
+
+gfx_setfont(1,"bauhaus 93",cell_len*1.25);
+pushcolour(1,1,0.2,0.35);
+TextOutline(19.5,2.35,ChangeString,1+8,0.1);
+gfx_setfont(1,"arial black",cell_len*0.707);
+pushcolour(1,1,1,0.0);
+pushcolour(1,1,1,0.5);
+TextOutline(13,12.9,"(C)2024 shabtronic@gmail.com",1+8,0.1);
+
+EndGFX();
+ValuesChanged? UpdateSliders();
+
+@slider
+UpdateSliders();
+
+@sample
+
+outl=spl0;
+outr=spl1;
+
+// Unused NR experiment - not good!
+0 && abs(outl)<0.0015?
+  (
+  outl=sign(outl)*pow(abs(outl),6)*50000000000;
+  outr=outl;
+  );
+  
+// Pre EQ
+outl=BiQuadProcess(Filters+8*0,outl);
+outr=BiQuadProcess(Filters+8*1,outr);
+
+// calc gate - a simple bias offset
+// thing that pushes noise into
+// a all positive signal and into silence beyond 
+// the clipper. Some funky math to get
+// the offset good for all gain settings
+//
+// The offset also removes even harmonics to some extent.
+//
+// *note* need to try this on my real world
+// MT-2 - see if the NR works as well
+// as in the digital domain.
+// I did in the 80's put my distortion
+// pedal directly in the tape head inputs on
+// my "Ghetto Blaster" and it's bias offset
+// did act as a noise-gate. Tho that was
+// after the pedals clipper and using whatever
+// clipped the tape circuit.
+
+p=(1-clamp((gain_db-20)/48,0,1));
+p=(pow(p,9)*10);
+goff=gate*0.00015+(gate*p)/1000;
+goff*=clamp(gain_db/20,0,1);
+
+// Oversample the clipper 
+// reduces Aliasing for standard guitars note range
+// with Synth notes aliasing would probably 
+// be audible
+
+outdl=(outl-loutl)*oooversample;
+outdr=(outr-loutr)*oooversample;
+suml=0;
+sumr=0;
+// using loop in case JSFX optimizes this?
+loop( oversample,
+      // Hard clip \m/
+      suml+=(clamp((loutl+goff)*gain,-1,1));
+      sumr+=(clamp((loutr+goff)*gain,-1,1));
+      loutl+=outdl;
+      loutr+=outdr;  
+      );
+foutl=suml*oooversample;
+foutr=sumr*oooversample;
+
+//loutl=outl;
+//loutr=outr;
+
+// DC High pass
+HPC=tan(40/(2*$pi*srate));
+hpl+=(foutl-hpl)*hpc;
+hpr+=(foutr-hpr)*hpc;
+foutl-=hpl;
+foutr-=hpr;
+
+// Post EQ - Fixed
+foutl=BiQuadProcess(Filters+8*2,foutl);
+foutr=BiQuadProcess(Filters+8*3,foutr);
+foutl=BiQuadProcess(Filters+8*4,foutl);
+foutr=BiQuadProcess(Filters+8*5,foutr);
+
+// Post EQ - User
+foutl=BiQuadProcess(Filters+8*6,foutl);
+foutr=BiQuadProcess(Filters+8*7,foutr);
+foutl=BiQuadProcess(Filters+8*8,foutl);
+foutr=BiQuadProcess(Filters+8*9,foutr);
+foutl=BiQuadProcess(Filters+8*10,foutl);
+foutr=BiQuadProcess(Filters+8*11,foutr);
+
+// Theres another low pass apparently 
+// but it's meh-o-clock, crack open the beers!!
+
+// Compensate for the post eq
+spl0 = foutl*level/18;
+spl1 = foutr*level/18;
+
+
